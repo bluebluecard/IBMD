@@ -1,0 +1,225 @@
+# ---------------------------------------------------------------
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+#
+# This work is licensed under the NVIDIA Source Code License
+# for I2SB. To view a copy of this license, see the LICENSE file.
+# ---------------------------------------------------------------
+
+from __future__ import absolute_import, division, print_function, unicode_literals
+
+import os
+import sys
+import random
+import argparse
+
+import copy
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import torch
+from torch.multiprocessing import Process
+
+from logger import Logger
+from distributed_util import init_processes
+from corruption import build_corruption
+from dataset import imagenet
+from i2sb import Runner, download_ckpt, RunnerDistill
+
+import colored_traceback.always
+from ipdb import set_trace as debug
+
+RESULT_DIR = Path("results")
+
+def set_seed(seed):
+    # https://github.com/pytorch/pytorch/issues/7068
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
+
+def create_training_options():
+    # --------------- basic ---------------
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed",           type=int,   default=0)
+    parser.add_argument("--name",           type=str,   default=None,        help="experiment ID")
+    parser.add_argument("--ckpt",           type=str,   default=None,        help="resumed checkpoint name")
+    parser.add_argument("--gpu",            type=int,   default=None,        help="set only if you wish to run on a particular device")
+    parser.add_argument("--n-gpu-per-node", type=int,   default=1,           help="number of gpu on each node")
+    parser.add_argument("--master-address", type=str,   default='localhost', help="address for master")
+    parser.add_argument("--node-rank",      type=int,   default=0,           help="the index of node")
+    parser.add_argument("--num-proc-node",  type=int,   default=1,           help="The number of nodes in multi node env")
+    parser.add_argument("--port",  type=str,   default="6020")
+    parser.add_argument("--debug-mode",     action="store_true",             help="Use identity network for debugging")
+    # parser.add_argument("--amp",            action="store_true")
+
+    # --------------- SB model ---------------
+    parser.add_argument("--image-size",     type=int,   default=256)
+    parser.add_argument("--corrupt",        type=str,   default=None,        help="restoration task")
+    parser.add_argument("--t0",             type=float, default=1e-4,        help="sigma start time in network parametrization")
+    parser.add_argument("--T",              type=float, default=1.,          help="sigma end time in network parametrization")
+    parser.add_argument("--interval",       type=int,   default=1000,        help="number of interval")
+    parser.add_argument("--beta-max",       type=float, default=0.3,         help="max diffusion for the diffusion model")
+    # parser.add_argument("--beta-min",       type=float, default=0.1)
+    parser.add_argument("--ot-ode",         action="store_true",             help="use OT-ODE model")
+    parser.add_argument("--clip-denoise",   action="store_true",             help="clamp predicted image to [-1,1] at each")
+
+    # optional configs for conditional network
+    parser.add_argument("--cond-x1",        action="store_true",             help="conditional the network on degraded images")
+    parser.add_argument("--add-x1-noise",   action="store_true",             help="add noise to conditional network")
+
+    # --------------- optimizer and loss ---------------
+    parser.add_argument("--batch-size",     type=int,   default=256)
+    parser.add_argument("--microbatch",     type=int,   default=2,           help="accumulate gradient over microbatch until full batch-size")
+    parser.add_argument("--num-itr",        type=int,   default=1000000,     help="training iteration")
+    parser.add_argument("--lr",             type=float, default=5e-5,        help="learning rate")
+    parser.add_argument("--lr-gamma",       type=float, default=0.99,        help="learning rate decay ratio")
+    parser.add_argument("--lr-step",        type=int,   default=1000,        help="learning rate decay step size")
+    parser.add_argument("--l2-norm",        type=float, default=0.0)
+    parser.add_argument("--ema",            type=float, default=0.99)
+
+    # --------------- path and logging ---------------
+    parser.add_argument("--dataset-dir",    type=Path,  default="/dataset",  help="path to LMDB dataset")
+    parser.add_argument("--log-dir",        type=Path,  default=".log",      help="path to log std outputs and writer data")
+    parser.add_argument("--log-writer",     type=str,   default=None,        help="log writer: can be tensorbard, wandb, or None")
+    parser.add_argument("--wandb-api-key",  type=str,   default=None,        help="unique API key of your W&B account; see https://wandb.ai/authorize")
+    parser.add_argument("--wandb-user",     type=str,   default=None,        help="user name of your W&B account")
+
+    # --------------- distillation ---------------
+    parser.add_argument("--distillation",   action="store_true",             help="")
+    parser.add_argument("--n-bridge-loop",  type=int,   default=10,          help="")
+    parser.add_argument("--bridge-pretrain-iters",  type=int,  default=1000, help="")
+    parser.add_argument("--x0-prediction-loss", action="store_true", help="")
+    parser.add_argument("--normalize-loss-by-loss", action="store_true", help="")
+    parser.add_argument("--normalize-generator-loss-by-t-power-ten", action="store_true", help="")
+    parser.add_argument("--normalize-generator-loss-by-t-power-ten-coeff", type=float, default=1, help="")
+    parser.add_argument("--normalize-bridge-loss-by-t-power-ten", action="store_true", help="")
+    parser.add_argument("--normalize-generator-loss-by-teacher-l1-loss", action="store_true", help="")
+    parser.add_argument("--multistep-bridge", action="store_true", help="Use multistep learning for bridge model")
+    parser.add_argument("--student-noise-input", action="store_true", help="Add noise as input to student model through conditional channels")
+    parser.add_argument("--model-add-noise-input", action="store_true", help="Add noise as input to runner model through conditional channels")
+    # parser.add_argument("--exponential-time-probability", action="store_true", help="")
+
+    parser.add_argument("--model-name-in-ckpt", type=str, default="net", help="the model name in the checkpoint")
+    parser.add_argument("--model-ema-name-in-ckpt", type=str, default="ema", help="the model ema name in the checkpoint")
+
+    parser.add_argument("--distillation-checkpoint",  type=str,   default=None,    help="")
+    parser.add_argument("--distillation-checkpoint-name",  type=str,   default=None,    help="")
+
+    parser.add_argument("--multistep-student", action="store_true", help="")
+    parser.add_argument("--multistep-student-use-fixed-steps", action="store_true", help="Use fixed evenly spaced steps for multistep student")
+    parser.add_argument("--multistep-student-num-fixed-steps", type=int, default=4, help="Number of fixed steps to use when multistep_student_use_fixed_steps is enabled")
+    parser.add_argument("--multistep-student-full-sampling", action="store_true", help="First do full sampling with student using NFE steps to get x_0")
+    parser.add_argument("--eval-nfe", type=int, default=1, help="")
+
+    parser.add_argument("--num-workers", type=int, default=4, help="")
+
+    parser.add_argument("--bridge-use-student-intermediate-steps", action="store_true", help="Use student's intermediate steps for bridge model training")
+
+    parser.add_argument("--init-student-from-ema", action="store_true", help="Initialize student from ema")
+
+    opt = parser.parse_args()
+
+    # ========= auto setup =========
+    opt.device='cuda' if opt.gpu is None else f'cuda:{opt.gpu}'
+    if opt.name is None:
+        opt.name = opt.corrupt
+    opt.distributed = opt.n_gpu_per_node > 1
+    opt.use_fp16 = False # disable fp16 for training
+
+    # log ngc meta data
+    if "NGC_JOB_ID" in os.environ.keys():
+        opt.ngc_job_id = os.environ["NGC_JOB_ID"]
+
+    # ========= path handle =========
+    os.makedirs(opt.log_dir, exist_ok=True)
+    opt.ckpt_path = RESULT_DIR / opt.name
+    os.makedirs(opt.ckpt_path, exist_ok=True)
+
+    if opt.ckpt is not None:
+        # debug()
+        ckpt_file = RESULT_DIR / opt.ckpt / "latest.pt"
+        assert ckpt_file.exists()
+        opt.load = ckpt_file
+    else:
+        opt.load = None
+
+    # if opt.distillation_checkpoint is not None:
+    #     distillation_ckpt_file = RESULT_DIR / opt.distillation_checkpoint / opt.distillation_checkpoint_name
+    #     assert distillation_ckpt_file.exists()
+    #     opt.distillation_load = distillation_ckpt_file
+
+    # ========= auto assert =========
+    assert opt.batch_size % opt.microbatch == 0, f"{opt.batch_size=} is not dividable by {opt.microbatch}!"
+    return opt
+
+def main(opt):
+    log = Logger(opt.global_rank, opt.log_dir)
+    log.info("=======================================================")
+    log.info("         Image-to-Image Schrodinger Bridge")
+    log.info("=======================================================")
+    log.info("Command used:\n{}".format(" ".join(sys.argv)))
+    log.info(f"Experiment ID: {opt.name}")
+
+    # set seed: make sure each gpu has differnet seed!
+    if opt.seed is not None:
+        set_seed(opt.seed + opt.global_rank)
+
+    # build imagenet dataset
+    train_dataset = imagenet.build_lmdb_dataset(opt, log, train=True)
+    val_dataset   = imagenet.build_lmdb_dataset(opt, log, train=False)
+    # note: images should be normalized to [-1,1] for corruption methods to work properly
+
+    if opt.corrupt == "mixture":
+        import corruption.mixture as mix
+        train_dataset = mix.MixtureCorruptDatasetTrain(opt, train_dataset)
+        val_dataset = mix.MixtureCorruptDatasetVal(opt, val_dataset)
+
+    # build corruption method
+    corrupt_method = build_corruption(opt, log)
+
+    if opt.distillation:
+        run = RunnerDistill(opt, log)
+    else:
+        run = Runner(opt, log)
+    
+    run.train(opt, train_dataset, val_dataset, corrupt_method)
+    log.info("Finish!")
+
+if __name__ == '__main__':
+    # torch.multiprocessing.set_start_method('forkserver')
+
+    opt = create_training_options()
+
+    assert opt.corrupt is not None
+
+    # one-time download: ADM checkpoint
+    download_ckpt("data/")
+    
+    if opt.distributed:
+        size = opt.n_gpu_per_node
+
+        processes = []
+        for rank in range(size):
+            opt = copy.deepcopy(opt)
+            opt.local_rank = rank
+            global_rank = rank + opt.node_rank * opt.n_gpu_per_node
+            global_size = opt.num_proc_node * opt.n_gpu_per_node
+            opt.global_rank = global_rank
+            opt.global_size = global_size
+            print('Node rank %d, local proc %d, global proc %d, global_size %d' % (opt.node_rank, rank, global_rank, global_size))
+            p = Process(target=init_processes, args=(global_rank, global_size, main, opt))
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+    else:
+        torch.cuda.set_device(0)
+        opt.global_rank = 0
+        opt.local_rank = 0
+        opt.global_size = 1
+        # init_processes(0, opt.n_gpu_per_node, main, opt)
+        init_processes(0, 1, main, opt)
