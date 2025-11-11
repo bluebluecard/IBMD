@@ -118,12 +118,6 @@ bash scripts/train.sh e2h
 bash scripts/train.sh imagenet_inpaint_center
 ```
 
-## License
-
-This project is licensed under the same license as the original I²SB and DDBM implementations. Please refer to:
-- `I2SB/LICENSE` for I²SB license information
-- The respective license files in `DiffusionBridge/` for DDBM license information
-
 ## Acknowledgments
 
 This codebase is built upon:
