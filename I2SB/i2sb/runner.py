@@ -29,6 +29,108 @@ from .diffusion import Diffusion
 
 from ipdb import set_trace as debug
 
+
+def resolve_cond_x1(opt, log):
+    cond_x1 = getattr(opt, "cond_x1", False)
+    if cond_x1 or not getattr(opt, "load", None):
+        return cond_x1
+
+    ckpt_path = Path(opt.load)
+    opt_pkl_path = ckpt_path.parent / "options.pkl"
+    if opt_pkl_path.exists():
+        try:
+            with open(opt_pkl_path, "rb") as f:
+                ckpt_opt = pickle.load(f)
+            if getattr(ckpt_opt, "cond_x1", False):
+                log.info(f"[Net] Inferred cond_x1=True from {opt_pkl_path}!")
+                return True
+        except Exception as exc:
+            log.warning(f"[Net] Failed to inspect {opt_pkl_path}: {exc}")
+
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        model_state = checkpoint.get(getattr(opt, "model_name_in_ckpt", "net"))
+        if isinstance(model_state, dict):
+            input_weight = model_state.get("input_blocks.0.0.weight")
+            if input_weight is not None and hasattr(input_weight, "shape") and len(input_weight.shape) >= 2:
+                in_channels = int(input_weight.shape[1])
+                if in_channels > 3:
+                    log.info(f"[Net] Inferred cond_x1=True from {ckpt_path} input channels={in_channels}!")
+                    return True
+    except Exception as exc:
+        log.warning(f"[Net] Failed to inspect checkpoint architecture from {ckpt_path}: {exc}")
+
+    return False
+
+
+def should_load_pretrained_adm(opt):
+    return not bool(getattr(opt, "load", None))
+
+def load_ema_with_compat(ema, model, ema_state, log, ckpt_path, role="Ema"):
+    if ema_state is None:
+        log.warning(f"[{role}] No EMA state provided for {ckpt_path}; using model weights.")
+        return ema
+
+    try:
+        ema.load_state_dict(ema_state)
+        log.info(f"[{role}] Loaded ema ckpt: {ckpt_path}!")
+        return ema
+    except (KeyError, ValueError, TypeError) as exc:
+        shadow = ema_state.get("shadow") if isinstance(ema_state, dict) else None
+        if not isinstance(shadow, dict):
+            raise
+
+        decay = float(ema_state.get("decay", getattr(ema, "decay", 0.999)))
+        loaded = 0
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                shadow_param = shadow.get(name)
+                if shadow_param is None:
+                    continue
+                if param.shape != shadow_param.shape:
+                    log.warning(
+                        f"[{role}] Skip EMA tensor with mismatched shape for {name}: "
+                        f"{tuple(shadow_param.shape)} != {tuple(param.shape)}"
+                    )
+                    continue
+                param.copy_(shadow_param.detach().to(param.device))
+                loaded += 1
+
+        compat_ema = ExponentialMovingAverage(model.parameters(), decay=decay)
+        log.warning(
+            f"[{role}] Converted codec-style EMA from {ckpt_path} after {type(exc).__name__}: "
+            f"loaded {loaded} shadow tensors into model weights."
+        )
+        return compat_ema
+
+
+def nchw_to_bcwh(x):
+    return x.permute(0, 1, 3, 2).contiguous()
+
+
+def bcwh_to_nchw(x):
+    return x.permute(0, 1, 3, 2).contiguous()
+
+
+def pad_width_to_target(x, target_w, mode="reflect"):
+    if target_w is None:
+        return x, 0, 0
+    width = x.shape[-1]
+    if width > target_w:
+        raise ValueError(f"Input width W={width} > target_w={target_w}")
+    if width == target_w:
+        return x, 0, 0
+    total = target_w - width
+    pad_left = total // 2
+    pad_right = total - pad_left
+    return F.pad(x, (pad_left, pad_right, 0, 0), mode=mode), pad_left, pad_right
+
+
+def crop_width(x, pad_left, pad_right):
+    if pad_left == 0 and pad_right == 0:
+        return x
+    return x[..., pad_left : x.shape[-1] - pad_right]
+
 def build_optimizer_sched(opt, net, log, load_student=False, load_bridge_model=False):
 
     optim_dict = {"lr": opt.lr, 'weight_decay': opt.l2_norm}
@@ -112,17 +214,31 @@ class Runner(object):
             log.info("Saved options pickle to {}!".format(opt_pkl_path))
 
         print(f"opt.beta_max = {opt.beta_max}")
-        betas = make_beta_schedule(n_timestep=opt.interval, linear_end=opt.beta_max / opt.interval)
-        betas = np.concatenate([betas[:opt.interval//2], np.flip(betas[:opt.interval//2])])
+        # Original I2SB schedule:
+        # betas = make_beta_schedule(n_timestep=opt.interval, linear_end=opt.beta_max / opt.interval)
+        # betas = np.concatenate([betas[:opt.interval//2], np.flip(betas[:opt.interval//2])])
+        #
+        # Use a constant per-step beta so the discrete schedule sums to opt.beta_max.
+        # This better matches a bridge-matching style process with total noise budget eps=beta_max.
+        betas = np.full(opt.interval, opt.beta_max / opt.interval, dtype=np.float64)
         self.diffusion = Diffusion(betas, opt.device)
         print("loaded diffusion!")
         log.info(f"[Diffusion] Built I2SB diffusion: steps={len(betas)}!")
 
         noise_levels = torch.linspace(opt.t0, opt.T, opt.interval, device=opt.device) * opt.interval
-        
-        NetworkClass = DebugIdentityNet if hasattr(opt, "debug_mode") else Image256Net
+        opt.cond_x1 = resolve_cond_x1(opt, log)
+        pretrained_adm = should_load_pretrained_adm(opt)
+
+        is_debug_mode = getattr(opt, "debug_mode", False)
+        NetworkClass = DebugIdentityNet if is_debug_mode else Image256Net
         print(f"opt.use_fp16 = {opt.use_fp16}")
-        self.net = NetworkClass(log, noise_levels=noise_levels, use_fp16=opt.use_fp16, cond=opt.cond_x1)
+        self.net = NetworkClass(
+            log,
+            noise_levels=noise_levels,
+            use_fp16=opt.use_fp16,
+            cond=opt.cond_x1,
+            pretrained_adm=pretrained_adm,
+        )
 
         print(f"opt.model_add_noise_input = {opt.model_add_noise_input}")
         if opt.model_add_noise_input:
@@ -130,20 +246,54 @@ class Runner(object):
         
         self.ema = ExponentialMovingAverage(self.net.parameters(), decay=opt.ema)
 
-        if opt.load and not hasattr(opt, "debug_mode"):  # Only load checkpoint if not in debug mode
+        if opt.load and not is_debug_mode:  # Only load checkpoint if not in debug mode
             print(f"loading {opt.load}")
             checkpoint = torch.load(opt.load, map_location="cpu")
             self.net.load_state_dict(checkpoint[opt.model_name_in_ckpt])
             log.info(f"[Net] Loaded network ckpt: {opt.load}!")
-            self.ema.load_state_dict(checkpoint[opt.model_ema_name_in_ckpt])
-            log.info(f"[Ema] Loaded ema ckpt: {opt.load}!")
-        elif hasattr(opt, "debug_mode"):
+            self.ema = load_ema_with_compat(
+                self.ema,
+                self.net,
+                checkpoint.get(opt.model_ema_name_in_ckpt),
+                log,
+                opt.load,
+                role="Ema",
+            )
+        elif is_debug_mode:
             log.info("[Debug Mode] Using identity network - no checkpoint loaded")
 
         self.net.to(opt.device)
         self.ema.to(opt.device)
 
         self.log = log
+        self.tensor_layout = getattr(opt, "tensor_layout", "nchw").lower()
+        self.pad_to_width = getattr(opt, "pad_to_width", None)
+        self.pad_mode = getattr(opt, "pad_mode", "reflect")
+        self.last_pad_left = 0
+        self.last_pad_right = 0
+
+    def _to_model_layout(self, x):
+        if self.tensor_layout == "bcwh":
+            return nchw_to_bcwh(x)
+        return x
+
+    def _from_model_layout(self, x):
+        if self.tensor_layout == "bcwh":
+            return bcwh_to_nchw(x)
+        return x
+
+    def _prepare_input_tensor(self, x):
+        x, pad_left, pad_right = pad_width_to_target(x, self.pad_to_width, mode=self.pad_mode)
+        x = self._to_model_layout(x)
+        return x, pad_left, pad_right
+
+    def _restore_output_tensor(self, x, pad_left=None, pad_right=None):
+        if pad_left is None:
+            pad_left = self.last_pad_left
+        if pad_right is None:
+            pad_right = self.last_pad_right
+        x = self._from_model_layout(x)
+        return crop_width(x, pad_left, pad_right)
 
     def compute_label(self, step, x0, xt):
         """ Eq 12 """
@@ -160,7 +310,11 @@ class Runner(object):
         return pred_x0
 
     def sample_batch(self, opt, loader, corrupt_method):
-        if opt.corrupt == "mixture":
+        if util.is_paired_dataset_mode(opt):
+            clean_img, corrupt_img = next(loader)
+            mask = None
+            y = None
+        elif opt.corrupt == "mixture":
             clean_img, corrupt_img, y = next(loader)
             mask = None
         elif "inpaint" in opt.corrupt:
@@ -178,9 +332,16 @@ class Runner(object):
         # tu.save_image((corrupt_img+1)/2, ".debug/corrupt.png", nrow=4)
         # debug()
 
-        y  = y.detach().to(opt.device)
+        y = None if y is None else y.detach().to(opt.device)
         x0 = clean_img.detach().to(opt.device)
         x1 = corrupt_img.detach().to(opt.device)
+        if util.is_paired_dataset_mode(opt):
+            x0, pad_left, pad_right = self._prepare_input_tensor(x0)
+            x1, x1_pad_left, x1_pad_right = self._prepare_input_tensor(x1)
+            if (pad_left, pad_right) != (x1_pad_left, x1_pad_right):
+                raise RuntimeError("Clean and corrupt padding offsets differ; expected identical shapes.")
+            self.last_pad_left = pad_left
+            self.last_pad_right = pad_right
         if mask is not None:
             mask = mask.detach().to(opt.device)
             x1 = (1. - mask) * x1 + mask * torch.randn_like(x1)
@@ -204,8 +365,9 @@ class Runner(object):
         train_loader = util.setup_loader(train_dataset, opt.microbatch, opt.num_workers)
         val_loader   = util.setup_loader(val_dataset,   opt.microbatch, opt.num_workers)
 
-        self.accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=1000).to(opt.device)
-        self.resnet = build_resnet50().to(opt.device)
+        if not util.is_paired_dataset_mode(opt):
+            self.accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=1000).to(opt.device)
+            self.resnet = build_resnet50().to(opt.device)
 
         net.train()
         n_inner_loop = opt.batch_size // (opt.global_size * opt.microbatch)
@@ -322,14 +484,21 @@ class Runner(object):
         log.info("Collecting tensors ...")
         img_clean   = all_cat_cpu(opt, log, img_clean)
         img_corrupt = all_cat_cpu(opt, log, img_corrupt)
-        y           = all_cat_cpu(opt, log, y)
+        y = all_cat_cpu(opt, log, y) if y is not None else None
         xs          = all_cat_cpu(opt, log, xs)
         pred_x0s    = all_cat_cpu(opt, log, pred_x0s)
+
+        if util.is_paired_dataset_mode(opt):
+            img_clean = self._restore_output_tensor(img_clean)
+            img_corrupt = self._restore_output_tensor(img_corrupt)
+            xs = self._restore_output_tensor(xs.reshape(-1, *xs.shape[2:])).reshape(xs.shape[0], xs.shape[1], *img_clean.shape[1:])
+            pred_x0s = self._restore_output_tensor(pred_x0s.reshape(-1, *pred_x0s.shape[2:])).reshape(pred_x0s.shape[0], pred_x0s.shape[1], *img_clean.shape[1:])
 
         batch, len_t, *xdim = xs.shape
         assert img_clean.shape == img_corrupt.shape == (batch, *xdim)
         assert xs.shape == pred_x0s.shape
-        assert y.shape == (batch,)
+        if y is not None:
+            assert y.shape == (batch,)
         log.info(f"Generated recon trajectories: size={xs.shape}")
 
         def log_image(tag, img, nrow=10):
@@ -348,10 +517,11 @@ class Runner(object):
         log_image("debug/pred_clean_traj", pred_x0s.reshape(-1, *xdim), nrow=len_t)
         log_image("debug/recon_traj",      xs.reshape(-1, *xdim),      nrow=len_t)
 
-        log.info("Logging accuracies ...")
-        log_accuracy("accuracy/clean",   img_clean)
-        log_accuracy("accuracy/corrupt", img_corrupt)
-        log_accuracy("accuracy/recon",   img_recon)
+        if y is not None:
+            log.info("Logging accuracies ...")
+            log_accuracy("accuracy/clean",   img_clean)
+            log_accuracy("accuracy/corrupt", img_corrupt)
+            log_accuracy("accuracy/recon",   img_recon)
 
         log.info(f"========== Evaluation finished: iter={it} ==========")
         torch.cuda.empty_cache()

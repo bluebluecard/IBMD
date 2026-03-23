@@ -122,9 +122,22 @@ where `NAME` is the experiment ID (default: `CORRUPT`), `N_GPU` is the number of
 Add `--ot-ode` for optionally training an OT-ODE model, _i.e.,_ the limit when the diffusion vanishes. By defualt, the model is discretized into 1000 steps; you can change it by adding `--interval $INTERVAL`.
 Note that we initialize the network with [ADM](https://github.com/openai/guided-diffusion) ([256x256_diffusion_uncond.pt](https://openaipublic.blob.core.windows.net/diffusion/jul-2021/256x256_diffusion_uncond.pt)), which will be automatically downloaded to `data/` at first call.
 
-Images and losses can be logged with either tensorboard (`LOGGER="tensorboard"`) or W&B (`LOGGER="wandb"`) in the directory `LOG_DIR`. To [autonamtically login W&B](https://docs.wandb.ai/quickstart#set-up-wb), specify additionally the flags `--wandb-api-key $WANDB_API_KEY --wandb-user $WANDB_USER` where `WANDB_API_KEY` is the unique API key (about 40 characters) of your account and `WANDB_USER` is your user name.
+Images and losses can be logged with either tensorboard (`LOGGER="tensorboard"`) or Comet (`LOGGER="comet"`) in the directory `LOG_DIR`. Comet credentials and defaults should be provided through the standard `COMET_API_KEY`, `COMET_PROJECT_NAME`, and `COMET_WORKSPACE` environment variables.
 
 To resume previous training from the checkpoint, add the flag `--ckpt $CKPT`.
+
+For paired clean/corrupt folder datasets such as LSDIR, use the paired dataset mode instead of LMDB:
+```bash
+python train.py --name $NAME --n-gpu-per-node $N_GPU \
+    --corrupt $CORRUPT --dataset-mode paired \
+    --clean-dataset-dir $CLEAN_ROOT \
+    --corrupt-dataset-dir $CORRUPT_ROOT \
+    --corrupt-subdir $CORRUPT_SUBDIR \
+    --batch-size $BATCH --microbatch $MICRO_BATCH \
+    --beta-max $BMAX --log-dir $LOG_DIR [--log-writer $LOGGER]
+```
+In paired mode, the dataset provides the degraded image directly from `--corrupt-dataset-dir`, so `--corrupt` remains experiment metadata and no runtime corruption is applied in `sample_batch`.
+By default, paired mode loads every sequence directory under `<split>/HR`. Add `--seq-name $SEQ_NAME` only if you want to restrict training to a single sequence.
 
 See [`scripts/train.sh`](https://github.com/NVlabs/I2SB/blob/master/scripts/train.sh) for the hyper-parameters of each restoration task.
 

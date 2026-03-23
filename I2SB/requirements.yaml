@@ -28,4 +28,4 @@ dependencies:
     - clean-fid==0.1.35
     - rich
     - lmdb
-    - wandb
+    - comet-ml

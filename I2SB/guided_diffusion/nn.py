@@ -98,6 +98,14 @@ def mean_flat(tensor):
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
 
+# def normalization(channels):
+#     """
+#     Make a standard normalization layer.
+
+#     :param channels: number of input channels.
+#     :return: an nn.Module for normalization.
+#     """
+#     return GroupNorm32(32, channels)
 def normalization(channels):
     """
     Make a standard normalization layer.
@@ -105,8 +113,12 @@ def normalization(channels):
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return GroupNorm32(32, channels)
-
+    # Fall back to the largest valid group count so narrower UNets such as
+    # num_channels=16 or 24 can still instantiate.
+    for num_groups in range(min(32, channels), 0, -1):
+        if channels % num_groups == 0:
+            return GroupNorm32(num_groups, channels)
+    raise ValueError(f"Unable to build GroupNorm for {channels} channels")
 
 def timestep_embedding(timesteps, dim, max_period=10000):
     """

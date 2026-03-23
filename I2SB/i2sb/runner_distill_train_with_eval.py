@@ -28,7 +28,7 @@ from . import util
 from .network import Image256Net, DebugIdentityNet
 # from .diffusion import Diffusion
 
-from .runner import Runner, all_cat_cpu
+from .runner import Runner, all_cat_cpu, load_ema_with_compat, should_load_pretrained_adm
 from torch.optim import AdamW, lr_scheduler
 
 from ipdb import set_trace as debug
@@ -292,8 +292,10 @@ class RunnerDistill(Runner):
         # log.info(f"[Diffusion] Built I2SB diffusion: steps={len(betas)}!")
 
         noise_levels = torch.linspace(opt.t0, opt.T, opt.interval, device=opt.device) * opt.interval
+        pretrained_adm = should_load_pretrained_adm(opt)
 
-        NetworkClass = DebugIdentityNet if hasattr(opt, "debug_mode") else Image256Net
+        is_debug_mode = getattr(opt, "debug_mode", False)
+        NetworkClass = DebugIdentityNet if is_debug_mode else Image256Net
         
         self.NetworkClass = NetworkClass
         self.noise_levels = noise_levels
@@ -301,41 +303,77 @@ class RunnerDistill(Runner):
         self.cond = opt.cond_x1
         self.ema_decay = opt.ema
         
-        self.bridge_model = NetworkClass(log, noise_levels=noise_levels, use_fp16=opt.use_fp16, cond=opt.cond_x1)
+        self.bridge_model = NetworkClass(
+            log,
+            noise_levels=noise_levels,
+            use_fp16=opt.use_fp16,
+            cond=opt.cond_x1,
+            pretrained_adm=pretrained_adm,
+        )
         self.bridge_model_ema = ExponentialMovingAverage(self.bridge_model.parameters(), decay=self.ema_decay)
 
-        self.student = NetworkClass(log, noise_levels=noise_levels, use_fp16=opt.use_fp16, cond=opt.cond_x1,
-                                    student_noise_input=opt.student_noise_input)
+        self.student = NetworkClass(
+            log,
+            noise_levels=noise_levels,
+            use_fp16=opt.use_fp16,
+            cond=opt.cond_x1,
+            student_noise_input=opt.student_noise_input,
+            pretrained_adm=pretrained_adm,
+        )
         self.student_ema = ExponentialMovingAverage(self.student.parameters(), decay=self.ema_decay)
         
         RESULT_DIR = Path("results")
 
-        if not hasattr(opt, "debug_mode"):  # Only load checkpoints if not in debug mode
+        if not is_debug_mode:  # Only load checkpoints if not in debug mode
             if hasattr(opt, "distillation_checkpoint") and opt.distillation_checkpoint:
                 distillation_load = RESULT_DIR / opt.distillation_checkpoint / opt.distillation_checkpoint_name
                 checkpoint = torch.load(distillation_load, map_location="cpu")
                 self.bridge_model.load_state_dict(checkpoint['bridge_model'])
                 log.info(f"[Bridge Model] Loaded network ckpt: {distillation_load}!")
-                self.bridge_model_ema.load_state_dict(checkpoint["bridge_model_ema"])
-                log.info(f"[Bridge Model Ema] Loaded ema ckpt: {distillation_load}!")
+                self.bridge_model_ema = load_ema_with_compat(
+                    self.bridge_model_ema,
+                    self.bridge_model,
+                    checkpoint.get("bridge_model_ema"),
+                    log,
+                    distillation_load,
+                    role="Bridge Model Ema",
+                )
 
                 # checkpoint = torch.load(distillation_load, map_location="cpu")
                 self.student.load_state_dict(checkpoint['student'])
                 log.info(f"[Student] Loaded network ckpt: {distillation_load}!")
-                self.student_ema.load_state_dict(checkpoint["student_ema"])
-                log.info(f"[Student Ema] Loaded ema ckpt: {distillation_load}!")
+                self.student_ema = load_ema_with_compat(
+                    self.student_ema,
+                    self.student,
+                    checkpoint.get("student_ema"),
+                    log,
+                    distillation_load,
+                    role="Student Ema",
+                )
             else:
                 checkpoint = torch.load(opt.load, map_location="cpu")
                 self.bridge_model.load_state_dict(checkpoint['net'])
                 log.info(f"[Bridge Model] Loaded network ckpt: {opt.load}!")
-                self.bridge_model_ema.load_state_dict(checkpoint["ema"])
-                log.info(f"[Bridge Model Ema] Loaded ema ckpt: {opt.load}!")
+                self.bridge_model_ema = load_ema_with_compat(
+                    self.bridge_model_ema,
+                    self.bridge_model,
+                    checkpoint.get("ema"),
+                    log,
+                    opt.load,
+                    role="Bridge Model Ema",
+                )
 
                 # checkpoint = torch.load(opt.load, map_location="cpu")
                 self.student.load_state_dict(checkpoint['net'])
                 log.info(f"[Student] Loaded network ckpt: {opt.load}!")
-                self.student_ema.load_state_dict(checkpoint["ema"])
-                log.info(f"[Student Ema] Loaded ema ckpt: {opt.load}!")
+                self.student_ema = load_ema_with_compat(
+                    self.student_ema,
+                    self.student,
+                    checkpoint.get("ema"),
+                    log,
+                    opt.load,
+                    role="Student Ema",
+                )
                 if opt.init_student_from_ema:
                     print(f"opt.init_student_from_ema = {opt.init_student_from_ema}")
                     self.student_ema.copy_to(self.student.parameters())
@@ -743,14 +781,21 @@ class RunnerDistill(Runner):
         log.info("Collecting tensors ...")
         img_clean   = all_cat_cpu(opt, log, img_clean)
         img_corrupt = all_cat_cpu(opt, log, img_corrupt)
-        y           = all_cat_cpu(opt, log, y)
+        y = all_cat_cpu(opt, log, y) if y is not None else None
         xs          = all_cat_cpu(opt, log, xs)
         pred_x0s    = all_cat_cpu(opt, log, pred_x0s)
+
+        if util.is_paired_dataset_mode(opt):
+            img_clean = self._restore_output_tensor(img_clean)
+            img_corrupt = self._restore_output_tensor(img_corrupt)
+            xs = self._restore_output_tensor(xs.reshape(-1, *xs.shape[2:])).reshape(xs.shape[0], xs.shape[1], *img_clean.shape[1:])
+            pred_x0s = self._restore_output_tensor(pred_x0s.reshape(-1, *pred_x0s.shape[2:])).reshape(pred_x0s.shape[0], pred_x0s.shape[1], *img_clean.shape[1:])
 
         batch, len_t, *xdim = xs.shape
         assert img_clean.shape == img_corrupt.shape == (batch, *xdim)
         assert xs.shape == pred_x0s.shape
-        assert y.shape == (batch,)
+        if y is not None:
+            assert y.shape == (batch,)
         log.info(f"Generated recon trajectories: size={xs.shape}")
 
         def log_image(tag, img, nrow=10):
@@ -769,10 +814,11 @@ class RunnerDistill(Runner):
         log_image("debug/pred_clean_traj", pred_x0s.reshape(-1, *xdim), nrow=len_t)
         log_image("debug/recon_traj",      xs.reshape(-1, *xdim),      nrow=len_t)
 
-        log.info("Logging accuracies ...")
-        log_accuracy("accuracy/clean",   img_clean)
-        log_accuracy("accuracy/corrupt", img_corrupt)
-        log_accuracy("accuracy/recon",   img_recon)
+        if y is not None:
+            log.info("Logging accuracies ...")
+            log_accuracy("accuracy/clean",   img_clean)
+            log_accuracy("accuracy/corrupt", img_corrupt)
+            log_accuracy("accuracy/recon",   img_recon)
 
         log.info(f"========== Evaluation finished: iter={it} ==========")
         torch.cuda.empty_cache()

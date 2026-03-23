@@ -7,7 +7,9 @@
 
 import os
 import io
+import random
 from tqdm.auto import tqdm
+from pathlib import Path
 
 from PIL import Image
 import lmdb
@@ -15,7 +17,8 @@ import lmdb
 import torch
 import torchvision.datasets as datasets
 from torchvision import transforms
-from torch.utils.data import Dataset
+from torchvision.transforms import functional as TF
+from torch.utils.data import Dataset, Subset
 
 from ipdb import set_trace as debug
 
@@ -211,6 +214,144 @@ def build_test_transform(image_size):
         transforms.Normalize(0.5,0.5),
     ])
 
+
+class PairedImageTransform:
+    def __init__(self, train):
+        self.train = train
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(0.5, 0.5)
+
+    def _transform_image(self, image, flip):
+        if flip:
+            image = TF.hflip(image)
+        image = self.to_tensor(image)
+        if image.shape != (3, 640, 360):
+            raise RuntimeError(
+                f"Expected paired raw tensor shape (3, 640, 360), got {tuple(image.shape)}"
+            )
+        return self.normalize(image)
+
+    def __call__(self, clean_img, corrupt_img):
+        flip = self.train and random.random() < 0.5
+        return self._transform_image(clean_img, flip), self._transform_image(corrupt_img, flip)
+
+
+class PairedImageFolderDataset(Dataset):
+    def __init__(self, clean_root, corrupt_root, corrupt_subdir, seq_name=None, transform=None):
+        super().__init__()
+        self.clean_root = Path(clean_root)
+        self.corrupt_root = Path(corrupt_root)
+        self.corrupt_subdir = corrupt_subdir
+        self.seq_name = seq_name
+        self.transform = transform
+        self.sequence_names = self._build_sequence_names()
+        self.samples = self._build_samples()
+
+    def _build_sequence_names(self):
+        if self.seq_name is not None:
+            return [self.seq_name]
+
+        clean_hr_root = self.clean_root / "HR"
+        corrupt_hr_root = self.corrupt_root / "HR"
+        if not clean_hr_root.is_dir():
+            raise RuntimeError(f"Missing clean HR directory: {clean_hr_root}")
+        if not corrupt_hr_root.is_dir():
+            raise RuntimeError(f"Missing corrupt HR directory: {corrupt_hr_root}")
+
+        clean_sequences = sorted(path.name for path in clean_hr_root.iterdir() if path.is_dir())
+        if not clean_sequences:
+            raise RuntimeError(f"No clean sequence directories found under {clean_hr_root}")
+
+        corrupt_sequences = sorted(path.name for path in corrupt_hr_root.iterdir() if path.is_dir())
+        if not corrupt_sequences:
+            raise RuntimeError(f"No corrupt sequence directories found under {corrupt_hr_root}")
+
+        missing_corrupt_sequences = sorted(set(clean_sequences) - set(corrupt_sequences))
+        extra_corrupt_sequences = sorted(set(corrupt_sequences) - set(clean_sequences))
+        if missing_corrupt_sequences or extra_corrupt_sequences:
+            error_lines = [
+                "Clean/corrupt sequence mismatch detected.",
+                f"clean_root={self.clean_root}",
+                f"corrupt_root={self.corrupt_root}",
+                f"corrupt_subdir={self.corrupt_subdir}",
+            ]
+            if missing_corrupt_sequences:
+                error_lines.append(f"Missing corrupt sequence: {missing_corrupt_sequences[0]}")
+                error_lines.append(f"Total missing corrupt sequences: {len(missing_corrupt_sequences)}")
+            if extra_corrupt_sequences:
+                error_lines.append(f"Extra corrupt sequence: {extra_corrupt_sequences[0]}")
+                error_lines.append(f"Total extra corrupt sequences: {len(extra_corrupt_sequences)}")
+            raise RuntimeError(" | ".join(error_lines))
+
+        return clean_sequences
+
+    def _build_sequence_samples(self, seq_name):
+        clean_seq_root = self.clean_root / "HR" / seq_name
+        corrupt_seq_root = self.corrupt_root / "HR" / seq_name / self.corrupt_subdir
+
+        clean_files = sorted(clean_seq_root.glob("*.png"))
+        if not clean_files:
+            raise RuntimeError(f"No clean PNG files found under {clean_seq_root}")
+
+        corrupt_files = sorted(corrupt_seq_root.glob("*.png"))
+        if not corrupt_files:
+            raise RuntimeError(
+                f"No corrupt PNG files found under {corrupt_seq_root}"
+            )
+
+        clean_map = {
+            path.name: path
+            for path in clean_files
+        }
+        corrupt_map = {
+            path.name: path
+            for path in corrupt_files
+        }
+
+        missing_corrupt = sorted(set(clean_map) - set(corrupt_map))
+        extra_corrupt = sorted(set(corrupt_map) - set(clean_map))
+
+        if missing_corrupt or extra_corrupt:
+            error_lines = [
+                "Clean/corrupt dataset mismatch detected.",
+                f"clean_root={self.clean_root}",
+                f"corrupt_root={self.corrupt_root}",
+                f"corrupt_subdir={self.corrupt_subdir}",
+            ]
+            if missing_corrupt:
+                file_name = missing_corrupt[0]
+                error_lines.append(f"Missing corrupt example: sequence={seq_name}, file={file_name}")
+                error_lines.append(f"Total missing corrupt files: {len(missing_corrupt)}")
+            if extra_corrupt:
+                file_name = extra_corrupt[0]
+                error_lines.append(f"Extra corrupt example: sequence={seq_name}, file={file_name}")
+                error_lines.append(f"Total extra corrupt files: {len(extra_corrupt)}")
+            raise RuntimeError(" | ".join(error_lines))
+
+        return [
+            (clean_map[key], corrupt_map[key])
+            for key in sorted(clean_map)
+        ]
+
+    def _build_samples(self):
+        samples = []
+        for seq_name in self.sequence_names:
+            samples.extend(self._build_sequence_samples(seq_name))
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        clean_path, corrupt_path = self.samples[index]
+        clean_img = Image.open(clean_path).convert("RGB")
+        corrupt_img = Image.open(corrupt_path).convert("RGB")
+
+        if self.transform is not None:
+            clean_img, corrupt_img = self.transform(clean_img, corrupt_img)
+
+        return clean_img, corrupt_img
+
 def build_lmdb_dataset(opt, log, train, transform=None):
     """ resize -> crop -> to_tensor -> norm(-1,1) """
     fn = opt.dataset_dir / ('train' if train else 'val')
@@ -222,6 +363,59 @@ def build_lmdb_dataset(opt, log, train, transform=None):
     dataset = _build_lmdb_dataset(fn, log, transform=transform)
     log.info(f"[Dataset] Built Imagenet dataset {fn=}, size={len(dataset)}!")
     return dataset
+
+
+def build_paired_dataset(opt, log, train, transform=None):
+    if train:
+        split = "train"
+    else:
+        split = "train" if getattr(opt, "val_on_train", False) else "val"
+    clean_root = opt.clean_dataset_dir / split
+    corrupt_root = opt.corrupt_dataset_dir / split
+
+    if transform is None:
+        transform = PairedImageTransform(train=train)
+
+    dataset = PairedImageFolderDataset(
+        clean_root=clean_root,
+        corrupt_root=corrupt_root,
+        corrupt_subdir=opt.corrupt_subdir,
+        seq_name=opt.seq_name,
+        transform=transform,
+    )
+    log.info(
+        f"[Dataset] Built paired dataset split={split}, clean_root={clean_root}, "
+        f"corrupt_root={corrupt_root}, corrupt_subdir={opt.corrupt_subdir}, "
+        f"sequence_filter={opt.seq_name or 'all'}, sequences={len(dataset.sequence_names)}, size={len(dataset)}!"
+    )
+    return dataset
+
+
+def maybe_limit_dataset(opt, log, dataset, train):
+    num_images = getattr(opt, "num_images", None)
+    if num_images is None:
+        return dataset
+
+    if num_images <= 0:
+        raise ValueError(f"num_images must be > 0 when provided, got {num_images}")
+
+    limited_size = min(len(dataset), num_images)
+    subset = Subset(dataset, range(limited_size))
+    split = "train" if train else "val"
+    log.info(
+        f"[Dataset] Limited {split} dataset to first {limited_size}/{len(dataset)} samples "
+        f"for debugging via num_images={num_images}."
+    )
+    return subset
+
+
+def build_dataset(opt, log, train, transform=None):
+    dataset_mode = getattr(opt, "dataset_mode", "lmdb")
+    if dataset_mode == "paired":
+        dataset = build_paired_dataset(opt, log, train, transform=transform)
+    else:
+        dataset = build_lmdb_dataset(opt, log, train, transform=transform)
+    return maybe_limit_dataset(opt, log, dataset, train)
 
 def build_lmdb_dataset_lmdb_folder_path(opt, log, train, transform=None, 
                                         lmdb_folder_path="/mnt/ar_hdd/ sel/imagenet_lmdb"):

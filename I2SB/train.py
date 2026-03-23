@@ -81,11 +81,19 @@ def create_training_options():
     parser.add_argument("--ema",            type=float, default=0.99)
 
     # --------------- path and logging ---------------
+    parser.add_argument("--dataset-mode",   type=str,   default="lmdb",      choices=["lmdb", "paired"], help="dataset backend")
     parser.add_argument("--dataset-dir",    type=Path,  default="/dataset",  help="path to LMDB dataset")
+    parser.add_argument("--clean-dataset-dir", type=Path, default=None,      help="path to clean paired dataset root")
+    parser.add_argument("--corrupt-dataset-dir", type=Path, default=None,    help="path to corrupt paired dataset root")
+    parser.add_argument("--corrupt-subdir", type=str,   default=None,        help="corrupt subdir name for paired dataset mode")
+    parser.add_argument("--seq-name",       type=str,   default=None,        help="optional single sequence folder for paired dataset mode; defaults to all sequences")
+    parser.add_argument("--num-images",     type=int,   default=None,        help="limit train and val datasets to the first fixed N samples for debugging")
+    parser.add_argument("--val-on-train",   action="store_true",             help="for paired dataset debugging, build validation from the train split")
+    parser.add_argument("--tensor-layout",  type=str,   default="nchw",      choices=["nchw", "bcwh"], help="model-facing tensor layout")
+    parser.add_argument("--pad-to-width",   type=int,   default=None,        help="pad paired tensors to target width")
+    parser.add_argument("--pad-mode",       type=str,   default="reflect",   help="padding mode for paired tensors")
     parser.add_argument("--log-dir",        type=Path,  default=".log",      help="path to log std outputs and writer data")
-    parser.add_argument("--log-writer",     type=str,   default=None,        help="log writer: can be tensorbard, wandb, or None")
-    parser.add_argument("--wandb-api-key",  type=str,   default=None,        help="unique API key of your W&B account; see https://wandb.ai/authorize")
-    parser.add_argument("--wandb-user",     type=str,   default=None,        help="user name of your W&B account")
+    parser.add_argument("--log-writer",     type=str,   default=None,        help="log writer: can be tensorboard, comet, or None")
 
     # --------------- distillation ---------------
     parser.add_argument("--distillation",   action="store_true",             help="")
@@ -152,6 +160,10 @@ def create_training_options():
     #     opt.distillation_load = distillation_ckpt_file
 
     # ========= auto assert =========
+    if opt.dataset_mode == "paired":
+        assert opt.clean_dataset_dir is not None, "--clean-dataset-dir is required for paired dataset mode"
+        assert opt.corrupt_dataset_dir is not None, "--corrupt-dataset-dir is required for paired dataset mode"
+        assert opt.corrupt_subdir is not None, "--corrupt-subdir is required for paired dataset mode"
     assert opt.batch_size % opt.microbatch == 0, f"{opt.batch_size=} is not dividable by {opt.microbatch}!"
     return opt
 
@@ -168,8 +180,8 @@ def main(opt):
         set_seed(opt.seed + opt.global_rank)
 
     # build imagenet dataset
-    train_dataset = imagenet.build_lmdb_dataset(opt, log, train=True)
-    val_dataset   = imagenet.build_lmdb_dataset(opt, log, train=False)
+    train_dataset = imagenet.build_dataset(opt, log, train=True)
+    val_dataset   = imagenet.build_dataset(opt, log, train=False)
     # note: images should be normalized to [-1,1] for corruption methods to work properly
 
     if opt.corrupt == "mixture":

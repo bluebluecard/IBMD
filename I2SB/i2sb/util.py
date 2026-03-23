@@ -7,7 +7,6 @@
 
 import os
 from torch.utils.tensorboard import SummaryWriter
-import wandb
 
 import torch
 from torch.utils.data import DataLoader
@@ -40,21 +39,37 @@ class BaseWriter(object):
         pass # do nothing
     def close(self): pass
 
-class WandBWriter(BaseWriter):
+class CometWriter(BaseWriter):
     def __init__(self, opt):
-        super(WandBWriter,self).__init__(opt)
+        super(CometWriter,self).__init__(opt)
         if self.rank == 0:
-            assert wandb.login(key=opt.wandb_api_key)
-            wandb.init(dir=str(opt.log_dir), project="i2sb", entity=opt.wandb_user, name=opt.name, config=vars(opt))
+            from comet_ml import Experiment
+
+            self.experiment = Experiment(
+                project_name=os.environ.get("COMET_PROJECT_NAME"),
+                workspace=os.environ.get("COMET_WORKSPACE"),
+                auto_output_logging="simple",
+                auto_metric_logging=False,
+                auto_param_logging=False,
+                auto_histogram_weight_logging=False,
+                auto_histogram_gradient_logging=False,
+                auto_histogram_activation_logging=False,
+            )
+            self.experiment.set_name(opt.name)
+            self.experiment.log_parameters(vars(opt))
 
     def add_scalar(self, step, key, val):
-        if self.rank == 0: wandb.log({key: val}, step=step)
+        if self.rank == 0:
+            self.experiment.log_metric(key, val, step=step)
 
     def add_image(self, step, key, image):
         if self.rank == 0:
-            # adopt from torchvision.utils.save_image
             image = image.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-            wandb.log({key: wandb.Image(image)}, step=step)
+            self.experiment.log_image(image, name=key, step=step)
+
+    def close(self):
+        if self.rank == 0:
+            self.experiment.end()
 
 
 class TensorBoardWriter(BaseWriter):
@@ -77,9 +92,17 @@ class TensorBoardWriter(BaseWriter):
         if self.rank == 0: self.writer.close()
 
 def build_log_writer(opt):
-    if opt.log_writer == 'wandb': return WandBWriter(opt)
-    elif opt.log_writer == 'tensorboard': return TensorBoardWriter(opt)
-    else: return BaseWriter(opt) # do nothing
+    if opt.log_writer == 'comet':
+        return CometWriter(opt)
+    if opt.log_writer == 'tensorboard':
+        return TensorBoardWriter(opt)
+    if opt.log_writer in [None, "none"]:
+        return BaseWriter(opt)
+    raise ValueError(f"Unsupported log writer: {opt.log_writer}")
+
+
+def is_paired_dataset_mode(opt):
+    return getattr(opt, "dataset_mode", "lmdb") == "paired"
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

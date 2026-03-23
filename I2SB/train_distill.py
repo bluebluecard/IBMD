@@ -81,9 +81,7 @@ def create_training_options():
     # --------------- path and logging ---------------
     parser.add_argument("--dataset-dir",    type=Path,  default="/dataset",  help="path to LMDB dataset")
     parser.add_argument("--log-dir",        type=Path,  default=".log",      help="path to log std outputs and writer data")
-    parser.add_argument("--log-writer",     type=str,   default=None,        help="log writer: can be tensorbard, wandb, or None")
-    parser.add_argument("--wandb-api-key",  type=str,   default=None,        help="unique API key of your W&B account; see https://wandb.ai/authorize")
-    parser.add_argument("--wandb-user",     type=str,   default=None,        help="user name of your W&B account")
+    parser.add_argument("--log-writer",     type=str,   default=None,        help="log writer: can be tensorboard, comet, or None")
 
     # --------------- distillation ---------------
     parser.add_argument("--distillation",   action="store_true",             help="add noise to conditional network")
@@ -105,7 +103,7 @@ def create_training_options():
     os.makedirs(opt.log_dir, exist_ok=True)
     opt.ckpt_path = RESULT_DIR / opt.name
     os.makedirs(opt.ckpt_path, exist_ok=True)
-
+    breakpoint()
     if opt.ckpt is not None:
         ckpt_file = RESULT_DIR / opt.ckpt / "latest.pt"
         assert ckpt_file.exists()
@@ -152,7 +150,7 @@ if __name__ == '__main__':
     assert opt.corrupt is not None
 
     # one-time download: ADM checkpoint
-    download_ckpt("data/")
+    #download_ckpt("data/")
 
     if opt.distributed:
         size = opt.n_gpu_per_node

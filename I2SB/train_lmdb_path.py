@@ -83,10 +83,8 @@ def create_training_options():
     # --------------- path and logging ---------------
     parser.add_argument("--dataset-dir",    type=Path,  default="/dataset",  help="path to LMDB dataset")
     parser.add_argument("--log-dir",        type=Path,  default=".log",      help="path to log std outputs and writer data")
-    parser.add_argument("--log-writer",     type=str,   default=None,        help="log writer: can be tensorbard, wandb, or None")
-    parser.add_argument("--wandb-api-key",  type=str,   default=None,        help="unique API key of your W&B account; see https://wandb.ai/authorize")
-    parser.add_argument("--wandb-user",     type=str,   default=None,        help="user name of your W&B account")
-    parser.add_argument("--lmdb_folder_path",     type=str,   default=None,        help="log writer: can be tensorbard, wandb, or None")
+    parser.add_argument("--log-writer",     type=str,   default=None,        help="log writer: can be tensorboard, comet, or None")
+    parser.add_argument("--lmdb_folder_path",     type=str,   default=None,        help="directory used to store generated LMDB files")
 
     # --------------- distillation ---------------
     parser.add_argument("--distillation",   action="store_true",             help="")
